@@ -1,0 +1,172 @@
+name: Build LiveContainerTV Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch or commit in hongson117/LiveContainerTV
+        required: false
+        default: 'main'
+      publish_release:
+        description: Publish verified LiveContainerTV.ipa to GitHub Releases & main
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-livecontainertv-release-build
+  cancel-in-progress: false
+
+jobs:
+  tvos:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hongson117/LiveContainerTV
+          ref: ${{ inputs.source_ref || 'main' }}
+          ssh-key: ${{ secrets.LCTV_SOURCE_READ_KEY }}
+          persist-credentials: false
+          show-progress: false
+          submodules: false
+
+      - name: Record private source commit
+        run: echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Run native & Python validation tests (sanitized output)
+        run: |
+          (
+            set -e
+            clang -fobjc-arc -framework Foundation -IHost Host/LCTVExpirySync.m tests/expiry_sync_tests.m -o "$RUNNER_TEMP/lctv-expiry-tests"
+            "$RUNNER_TEMP/lctv-expiry-tests"
+
+            python3 -m venv "$RUNNER_TEMP/lctv-python"
+            "$RUNNER_TEMP/lctv-python/bin/pip" install -q -r scripts/requirements.txt
+            "$RUNNER_TEMP/lctv-python/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
+            "$RUNNER_TEMP/lctv-python/bin/python" tests/test_certificate_installer.py --write-native-fixtures "$RUNNER_TEMP/lctv-fixtures"
+            SSL=$(brew --prefix openssl@3)
+            clang -fobjc-arc -framework Foundation -IHost -I"$SSL/include" -L"$SSL/lib" -Wl,-rpath,"$SSL/lib" Host/LCTVBootstrap.m tests/bootstrap_tests.m -lcrypto -o "$RUNNER_TEMP/lctv-bootstrap-tests"
+            "$RUNNER_TEMP/lctv-bootstrap-tests" "$RUNNER_TEMP/lctv-fixtures"
+          ) >/tmp/lctv-tests.log 2>&1 || {
+            grep -E 'error:|FAIL:|ERROR:' /tmp/lctv-tests.log | head -n 25 || true
+            echo "Validation tests failed; private source snippets were not uploaded."
+            exit 1
+          }
+          echo "All native & Python validation tests passed."
+
+      - name: Fetch OpenSSL.xcframework & build unsigned tvOS IPA
+        run: |
+          git clone --depth 1 https://github.com/krzyzanowskim/OpenSSL.git OpenSSL >/tmp/openssl.log 2>&1
+          test -d OpenSSL/Frameworks/OpenSSL.xcframework/tvos-arm64
+          brew install xcodegen >/tmp/brew.log 2>&1 || true
+          xcodegen generate >/tmp/xcodegen.log 2>&1
+          xcodebuild build -project LiveContainerTV.xcodeproj -target LiveContainerTV -sdk appletvos -configuration Release \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" SYMROOT="$PWD/build" >/tmp/xcodebuild.log 2>&1 || {
+            grep -E 'error:' /tmp/xcodebuild.log | sed -E 's|^/.*/Host/|Host/|; s|^/.*/ZSign/|ZSign/|' | head -n 30 || true
+            echo "tvOS build failed; private source snippets were not uploaded."
+            exit 1
+          }
+          grep -q "BUILD SUCCEEDED" /tmp/xcodebuild.log
+          echo "Unsigned Release tvOS build succeeded."
+
+      - name: Package & verify clean IPA
+        run: |
+          set -eo pipefail
+          APP=build/Release-appletvos/LiveContainerTV.app
+          BUNDLE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
+          BUNDLE_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist")
+          if [ ! -d "$APP/Frameworks/OpenSSL.framework" ] && [ -d OpenSSL/Frameworks/OpenSSL.xcframework/tvos-arm64/OpenSSL.framework ]; then
+            mkdir -p "$APP/Frameworks"
+            cp -R OpenSSL/Frameworks/OpenSSL.xcframework/tvos-arm64/OpenSSL.framework "$APP/Frameworks/"
+          fi
+          mkdir -p out/Payload publish
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry ../publish/LiveContainerTV.ipa Payload)
+
+          L=$(unzip -l publish/LiveContainerTV.ipa)
+          for f in Payload/LiveContainerTV.app/Info.plist Payload/LiveContainerTV.app/LiveContainerTV Payload/LiveContainerTV.app/Assets.car Payload/LiveContainerTV.app/lctv_logo.png Payload/LiveContainerTV.app/Frameworks/OpenSSL.framework/OpenSSL; do
+            echo "$L" | grep -q " $f\$" || { echo "MISSING $f"; exit 1; }
+          done
+          if echo "$L" | grep -qi guestdemo; then echo "GuestDemo must not be in IPA"; exit 1; fi
+          if echo "$L" | grep -Ei 'LCTVBootstrap\.plist|\.p12$|\.pfx$|\.pem$|\.key$'; then echo "Private signing identity must not be published"; exit 1; fi
+
+          IPA_SIZE=$(stat -f%z publish/LiveContainerTV.ipa)
+          IPA_SHA256=$(shasum -a 256 publish/LiveContainerTV.ipa | awk '{print $1}')
+          (cd publish && shasum -a 256 LiveContainerTV.ipa > SHA256SUMS.txt)
+          python3 - <<PY
+          import json, pathlib
+          pathlib.Path('publish/version.json').write_text(json.dumps({
+              'version': '${BUNDLE_VER}',
+              'build': int('${BUNDLE_BUILD}'),
+              'sha256': '${IPA_SHA256}',
+              'assetSize': int('${IPA_SIZE}'),
+              'sourceCommit': '${SOURCE_SHA:0:7}'
+          }, indent=2) + '\n', encoding='utf-8')
+          PY
+          ls -lh publish/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-public-release-${{ github.run_number }}
+          retention-days: 5
+          if-no-files-found: error
+          path: |
+            publish/LiveContainerTV.ipa
+            publish/SHA256SUMS.txt
+            publish/version.json
+
+  publish:
+    if: ${{ inputs.publish_release }}
+    needs: [tvos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: LiveContainerTV-public-release-*
+          path: release-files
+          merge-multiple: true
+      - name: Publish GitHub Release & sync SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(python3 -c "import json; print(json.load(open('release-files/version.json'))['version'])")
+          BUILD=$(python3 -c "import json; print(json.load(open('release-files/version.json'))['build'])")
+          SHA=$(python3 -c "import json; print(json.load(open('release-files/version.json'))['sha256'])")
+          SIZE=$(python3 -c "import json; print(json.load(open('release-files/version.json'))['assetSize'])")
+          TAG="v${VER}"
+
+          cat <<EOF > /tmp/release-notes.md
+          ### LiveContainerTV v${VER} (Build ${BUILD}) — Multi-App Container for Apple TV
+
+          - **4AppleTV Control API v1 (`:8228` + `_lctv._tcp` Bonjour)**: Cho phép xem danh sách ứng dụng bên trong LiveContainerTV, cài thẳng gói \`.ipa\` / \`.deb\` (Kodi, Orivio, Nuvio, Stremio...), kích hoạt/ký lại và mở thẳng ứng dụng khách chỉ với 1 chạm ngay từ **4AppleTV v1.3.0+**.
+          - **Tương thích hoàn chỉnh Kodi 21.3 tvOS & App dung lượng lớn**: Bộ giải nén streaming hỗ trợ >65.535 tệp + ZIP64 + Symlink UNIX, tự bỏ qua \`PlugIns/*.appex\` (tiết kiệm slot App ID), ký đầy đủ 42 mô-đun \`.so\` (\`MH_BUNDLE\`) và bỏ qua \`MH_OBJECT\`.
+          - **Lưu trữ bền vững chống tvOS tự xoá cache**: Chuyển kho ứng dụng sang \`Application Support/LCTV/LCApps\` (tự động di chuyển dữ liệu cũ từ \`Caches/LCApps\`).
+
+          **Asset:** \`LiveContainerTV.ipa\` (\`${SIZE}\` bytes)
+          **SHA-256:** \`${SHA}\`
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-files/LiveContainerTV.ipa release-files/SHA256SUMS.txt release-files/version.json --clobber
+            gh release edit "$TAG" --title "LiveContainerTV v${VER} (tvOS)" --notes-file /tmp/release-notes.md --latest
+          else
+            gh release create "$TAG" release-files/LiveContainerTV.ipa release-files/SHA256SUMS.txt release-files/version.json \
+              --title "LiveContainerTV v${VER} (tvOS)" --notes-file /tmp/release-notes.md --latest
+          fi
+
+          cp release-files/SHA256SUMS.txt SHA256SUMS.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add SHA256SUMS.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): publish LiveContainerTV v${VER} [SHA-256: ${SHA:0:12}]"
+            git push origin HEAD:main
+          fi
